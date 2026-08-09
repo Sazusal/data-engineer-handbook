@@ -1,23 +1,196 @@
-import streamlit as st
+"""Support Desk Flask Application.
 
-from db import (
-    get_tickets,
-    get_ticket,
-    get_ticket_messages,
-    create_ticket,
-    add_message,
-    update_ticket_status,
-)
+Provides a REST API for managing support tickets stored in Lakebase (Postgres).
+
+Endpoints:
+- GET /: Main ticket management UI
+- GET /healthz: Health check
+- GET /tickets: List all tickets
+- GET /tickets/<id>: Get a specific ticket
+- GET /tickets/<id>/messages: Get messages for a ticket
+- POST /tickets: Create a new ticket
+- POST /tickets/<id>/messages: Add a message to a ticket
+- PUT /tickets/<id>/status: Update ticket status
+
+Deploy as a Databricks App using app.yaml.
+"""
+
+import logging
+import os
+from datetime import datetime
+
+from databricks.sdk import WorkspaceClient
+from flask import Flask, jsonify, render_template, request
+
+import db
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("support-desk-app")
+
+app = Flask(__name__)
+_w = WorkspaceClient()
 
 
-st.set_page_config(
-    page_title="Support Desk",
-    page_icon="🎫",
-    layout="wide",
-)
+def _current_user_name() -> str:
+    """
+    Resolve the current user's name from the X-Forwarded-Email header.
+    Falls back to SDK's current_user API for local development.
+    """
+    header_email = request.headers.get("X-Forwarded-Email")
+    if header_email:
+        return header_email.split("@")[0]  # Use email prefix as name
+    return _w.current_user.me().user_name
 
 
-st.title("🎫 Support Desk")
+@app.route("/healthz")
+def healthz():
+    """Health check endpoint."""
+    return jsonify({"status": "ok"})
+
+
+@app.errorhandler(Exception)
+def handle_exception(err):
+    """Ensure all unhandled errors return JSON."""
+    logger.exception("Unhandled exception while processing request")
+    status_code = getattr(err, "code", 500)
+    if not isinstance(status_code, int):
+        status_code = 500
+    return jsonify({"error": str(err)}), status_code
+
+
+@app.route("/")
+def index():
+    """Serve the main Support Desk UI."""
+    return render_template("tickets.html")
+
+
+@app.route("/tickets", methods=["GET"])
+def list_tickets():
+    """List all support tickets."""
+    try:
+        tickets = db.get_tickets()
+        # Convert datetime objects to ISO strings
+        for ticket in tickets:
+            if ticket.get("created_at"):
+                ticket["created_at"] = ticket["created_at"].isoformat()
+        return jsonify(tickets)
+    except Exception as e:
+        logger.exception("Error listing tickets")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/tickets/<int:ticket_id>", methods=["GET"])
+def get_ticket(ticket_id):
+    """Get a specific ticket by ID."""
+    try:
+        ticket = db.get_ticket(ticket_id)
+        if not ticket:
+            return jsonify({"error": "Ticket not found"}), 404
+        
+        # Convert datetime to ISO string
+        if ticket.get("created_at"):
+            ticket["created_at"] = ticket["created_at"].isoformat()
+        
+        return jsonify(ticket)
+    except Exception as e:
+        logger.exception(f"Error getting ticket {ticket_id}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/tickets/<int:ticket_id>/messages", methods=["GET"])
+def get_ticket_messages(ticket_id):
+    """Get all messages for a specific ticket."""
+    try:
+        messages = db.get_ticket_messages(ticket_id)
+        # Convert datetime objects to ISO strings
+        for msg in messages:
+            if msg.get("created_at"):
+                msg["created_at"] = msg["created_at"].isoformat()
+        return jsonify(messages)
+    except Exception as e:
+        logger.exception(f"Error getting messages for ticket {ticket_id}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/tickets", methods=["POST"])
+def create_ticket():
+    """Create a new support ticket."""
+    try:
+        data = request.get_json()
+        if not data or not data.get("title"):
+            return jsonify({"error": "Title is required"}), 400
+        
+        title = data["title"].strip()
+        created_by = data.get("created_by", _current_user_name()).strip()
+        
+        if not title:
+            return jsonify({"error": "Title cannot be empty"}), 400
+        
+        # Ensure tables exist
+        db.ensure_tables()
+        
+        ticket_id = db.create_ticket(title, created_by)
+        return jsonify({"ticket_id": ticket_id, "message": "Ticket created successfully"}), 201
+    
+    except Exception as e:
+        logger.exception("Error creating ticket")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/tickets/<int:ticket_id>/messages", methods=["POST"])
+def add_message(ticket_id):
+    """Add a message to an existing ticket."""
+    try:
+        data = request.get_json()
+        if not data or not data.get("message_text"):
+            return jsonify({"error": "Message text is required"}), 400
+        
+        message_text = data["message_text"].strip()
+        author = data.get("author", _current_user_name()).strip()
+        
+        if not message_text:
+            return jsonify({"error": "Message cannot be empty"}), 400
+        
+        message_id = db.add_message(ticket_id, message_text, author)
+        return jsonify({"message_id": message_id, "message": "Message added successfully"}), 201
+    
+    except Exception as e:
+        logger.exception(f"Error adding message to ticket {ticket_id}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/tickets/<int:ticket_id>/status", methods=["PUT"])
+def update_status(ticket_id):
+    """Update the status of an existing ticket."""
+    try:
+        data = request.get_json()
+        if not data or not data.get("status"):
+            return jsonify({"error": "Status is required"}), 400
+        
+        status = data["status"].strip().upper()
+        db.update_ticket_status(ticket_id, status)
+        
+        return jsonify({"message": "Status updated successfully"})
+    
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.exception(f"Error updating status for ticket {ticket_id}")
+        return jsonify({"error": str(e)}), 500
+
+
+if __name__ == '__main__':
+    # Ensure database tables exist on startup
+    try:
+        db.ensure_tables()
+        logger.info("Database tables initialized")
+    except Exception as e:
+        logger.error(f"Failed to initialize database tables: {e}")
+    
+    host = os.getenv('FLASK_RUN_HOST', '0.0.0.0')
+    port = int(os.getenv('FLASK_RUN_PORT', 8000))
+    app.run(debug=True, host=host, port=port)
+    print(f"Support Desk app running on http://{host}:{port}")
 
 
 # ---------------------------------------------------------
